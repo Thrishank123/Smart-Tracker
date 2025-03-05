@@ -29,8 +29,7 @@ st.set_page_config(page_title="Smart Travel Planner", layout="wide")
 # --------------------------------------
 @st.cache_resource
 def load_knn_model():
-    with open("Knn.pkl", "rb") as file:
-        model = joblib.load(file)
+    model = joblib.load("Knn.pkl")
     return model
 
 model = load_knn_model()
