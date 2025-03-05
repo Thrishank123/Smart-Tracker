@@ -6,9 +6,9 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.express as px
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from collections import Counter
 
 st.set_page_config(page_title="Smart Travel Planner", layout="wide")
-
 
 WEATHER_API_URL = "https://weatherapi-com.p.rapidapi.com/forecast.json"
 
@@ -25,34 +25,49 @@ def get_weather_data(query, days=7):
     else:
         st.error(f"Error fetching forecast data: {response.status_code}")
         return None
+
+# New scoring function based on preferred weather condition.
+def score_day(day, condition):
+    avgtemp = day["day"]["avgtemp_c"]
+    maxtemp = day["day"]["maxtemp_c"]
+    mintemp = day["day"]["mintemp_c"]
+    humidity = day["day"].get("avghumidity", 0)
+    precip = day["day"].get("totalprecip_mm", 0)
     
-def find_optimal_travel_date(forecast, user_date):
-    """
-    Suggests an optimal travel date based on a simple heuristic:
-    selects the forecast day (on or after user_date) with the highest score,
-    where score = avgtemp - 2 * total precipitation.
-    """
+    if condition == "Sunny":
+        # Sunny: high temp, low humidity, low precipitation
+        return avgtemp - 0.3 * humidity - 2 * precip
+    elif condition == "Rainy":
+        # Rainy: higher precipitation preferred
+        return precip + 0.5 * humidity
+    elif condition == "Mild":
+        # Mild: avg temp close to 20°C, low precip and moderate humidity
+        return -abs(avgtemp - 20) - 0.5 * humidity - 2 * precip
+    elif condition == "Cold":
+        # Cold: lower temperatures are preferred
+        return -avgtemp - 2 * precip
+    else:
+        return avgtemp - 0.3 * humidity - 2 * precip
+
+def find_optimal_travel_date(forecast, user_date, preferred_condition):
     best_score = -np.inf
     best_date = None
     for day in forecast:
         date_str = day["date"]
         date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
         if date_obj >= user_date:
-            avg_temp = day["day"]["avgtemp_c"]
-            precip = day["day"].get("totalprecip_mm", 0)
-            score = avg_temp - 2 * precip
+            score = score_day(day, preferred_condition)
             if score > best_score:
                 best_score = score
                 best_date = date_str
     return best_date
+
 # For Open-Meteo historical API
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-# --------------------------------------
-# Custom CSS for better mobile UI (adjust as needed)
-# --------------------------------------
+# Custom CSS for better mobile UI
 st.markdown("""
     <style>
     @media only screen and (max-width: 600px) {
@@ -61,16 +76,10 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --------------------------------------
 # Setup cache and retry for historical API calls
-# --------------------------------------
 cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
-
-# --------------------------------------
-# Streamlit Page Configuration
-# --------------------------------------
 
 # --------------------------------------
 # 1. Load Pre-trained KNN Model (trained on processed historical data)
@@ -170,10 +179,7 @@ def get_full_historical_dataframe(lat, lon, start_date, end_date):
 # --------------------------------------
 # 4b. Process the Forecast Data (for prediction)
 # Here we create a simple processing function that extracts and scales key features.
-# Adjust this processing to match the training pipeline of your model.
 def process_forecast_data(forecast):
-    # For each forecast day, extract a set of key features:
-    # average temperature, total precipitation, max wind speed, average humidity.
     data = []
     for day in forecast:
         avgtemp = day["day"]["avgtemp_c"]
@@ -182,143 +188,12 @@ def process_forecast_data(forecast):
         avghumidity = day["day"].get("avghumidity", 0)
         data.append([avgtemp, totalprecip, maxwind, avghumidity])
     df = pd.DataFrame(data, columns=["avgtemp", "totalprecip", "maxwind", "avghumidity"])
-    # Scale features as per training; here we use MinMax scaling as an example.
     scaler = MinMaxScaler()
     df_scaled = pd.DataFrame(scaler.fit_transform(df), columns=df.columns)
     return df_scaled
 
 # --------------------------------------
 # 5. Streamlit App Layout & User Inputs
-# --------------------------------------
-def Processed(df):
-    # ---------------------------
-    # Date Conversion and Time-Based Features
-    # ---------------------------
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df['day_of_week'] = df['date'].dt.dayofweek   # Monday=0, Sunday=6
-    df['month'] = df['date'].dt.month
-    df['year'] = df['date'].dt.year
-
-    # ---------------------------
-    # Define Season Based on Country and Month
-    # ---------------------------
-    def get_season(row):
-        month = row['month']
-        country = str(row['Country']).strip().lower() if 'Country' in row else ""
-        southern_countries = ['australia', 'new zealand', 'south africa', 'argentina', 'chile', 'brazil']
-        if country in southern_countries:
-            if month in [12, 1, 2]:
-                return 'Summer'
-            elif month in [3, 4, 5]:
-                return 'Autumn'
-            elif month in [6, 7, 8]:
-                return 'Winter'
-            elif month in [9, 10, 11]:
-                return 'Spring'
-        else:
-            if month in [12, 1, 2]:
-                return 'Winter'
-            elif month in [3, 4, 5]:
-                return 'Spring'
-            elif month in [6, 7, 8]:
-                return 'Summer'
-            elif month in [9, 10, 11]:
-                return 'Autumn'
-    df['season'] = df.apply(get_season, axis=1)
-
-    # ---------------------------
-    # Handle Missing Data
-    # ---------------------------
-    df.fillna(method="ffill", inplace=True)
-    df.fillna(method="bfill", inplace=True)
-
-    # ---------------------------
-    # Drop Less Relevant Columns
-    # ---------------------------
-    soil_columns = [col for col in df.columns if "soil" in col.lower()]
-    if soil_columns:
-        df.drop(columns=soil_columns, inplace=True)
-
-    # ---------------------------
-    # Advanced Feature Engineering
-    # ---------------------------
-    wind_cols = [col for col in ['wind_speed_10m', 'wind_speed_80m', 'wind_speed_120m', 'wind_speed_180m'] if col in df.columns]
-    if wind_cols:
-        df['avg_wind_speed'] = df[wind_cols].mean(axis=1)
-    else:
-        df['avg_wind_speed'] = np.nan
-
-    cloud_cols = [col for col in ['cloud_cover', 'cloud_cover_low', 'cloud_cover_mid', 'cloud_cover_high'] if col in df.columns]
-    if cloud_cols:
-        df['avg_cloud_cover'] = df[cloud_cols].mean(axis=1)
-
-    if 'apparent_temperature' in df.columns and 'temperature_2m' in df.columns:
-        df['temp_difference'] = df['apparent_temperature'] - df['temperature_2m']
-
-    severity_features = [col for col in ['precipitation', 'snowfall', 'showers'] if col in df.columns]
-    if severity_features:
-        df['weather_severity_index'] = df[severity_features].sum(axis=1)
-    else:
-        df['weather_severity_index'] = 0
-
-    tci_weights = {
-        'temperature_2m': 0.4,
-        'relative_humidity_2m': 0.3,
-        'precipitation': -0.3,
-        'wind_speed_10m': -0.1
-    }
-    tci_features = [feat for feat in tci_weights.keys() if feat in df.columns]
-    if tci_features:
-        scaler_mm = MinMaxScaler()
-        df_norm = pd.DataFrame(scaler_mm.fit_transform(df[tci_features]),
-                               columns=tci_features, index=df.index)
-        df['travel_comfort_index'] = 0
-        for feat in tci_features:
-            df['travel_comfort_index'] += tci_weights[feat] * df_norm[feat]
-    else:
-        df['travel_comfort_index'] = np.nan
-
-    if 'temperature_2m' in df.columns and 'relative_humidity_2m' in df.columns:
-        df['temp_humidity_interaction'] = df['temperature_2m'] * df['relative_humidity_2m']
-
-    # ---------------------------
-    # Encode Categorical Variables (Country, city, season)
-    # ---------------------------
-    for cat in ['Country', 'city', 'season']:
-        if cat in df.columns:
-            df[cat] = df[cat].astype(str).str.strip()
-            dummies = pd.get_dummies(df[cat], prefix=cat, drop_first=True)
-            df = pd.concat([df, dummies], axis=1)
-            df.drop(columns=[cat], inplace=True)
-
-    # ---------------------------
-    # Create TCI Classes (Low, Medium, High)
-    # ---------------------------
-    df['TCI_class'] = pd.qcut(df['travel_comfort_index'], q=3, labels=['Low', 'Medium', 'High'])
-
-    # ---------------------------
-    # Scaling Numeric Features for Modeling
-    # ---------------------------
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    scaler_std = StandardScaler()
-    df[numeric_cols] = scaler_std.fit_transform(df[numeric_cols])
-    
-    # At this point, we need to ensure that the final feature set used for prediction has exactly 65 columns.
-    # We assume that the model was trained on 65 features (excluding the 'date' column and target column).
-    # Let's remove the non-feature columns and then pad with zeros if necessary.
-    features_df = df.drop(columns=["date", "TCI_class"], errors='ignore')
-    current_feature_count = features_df.shape[1]
-    if current_feature_count < 65:
-        # Add dummy columns
-        for i in range(65 - current_feature_count):
-            features_df[f"dummy_{i}"] = 0
-    elif current_feature_count > 65:
-        st.error(f"Error: Processed feature count ({current_feature_count}) exceeds expected 65. Adjust your processing.")
-    # Optionally, you can combine with the date if needed, but for model input we only use the 65 features.
-    return pd.concat([df[["date"]], features_df], axis=1)
-
-# --------------------------------------
-# Main App Layout & User Inputs (Forecast & Historical Predictions)
 # --------------------------------------
 st.title("🌍 Smart Travel Planner")
 st.subheader("Your AI-powered companion for personalized travel recommendations")
@@ -384,9 +259,12 @@ if st.sidebar.button("Get 7-Day Forecast Predictions"):
             else:
                 st.info("No severe weather alerts.")
             
-            optimal_date = find_optimal_travel_date(filtered_forecast, user_forecast_start)
+            # Find the optimal travel date using the new heuristic based on preferred weather condition.
+            optimal_date = None
+            optimal_date = find_optimal_travel_date(filtered_forecast, user_forecast_start, preferred_climate)
             st.markdown(f"### Optimal Travel Date Suggestion: **{optimal_date}**")
             
+            # Display forecast summary in a table and line chart.
             forecast_df = pd.DataFrame([{
                 "Date": f["date"],
                 "Max Temp": f["day"]["maxtemp_c"],
@@ -401,47 +279,24 @@ if st.sidebar.button("Get 7-Day Forecast Predictions"):
                           title="Forecast Temperature Trend", markers=True)
             st.plotly_chart(fig, use_container_width=True)
             
-            # --- 7-Day Travel Comfort Predictions from Forecast Data ---
-            # After computing optimal_date, print it:
-            st.markdown(f"### Optimal Travel Date Suggestion: **{optimal_date}**")
-
-            # Find the forecast day corresponding to the optimal date
-            optimal_day = next((day for day in filtered_forecast if day["date"] == optimal_date), None)
-
-            if optimal_day:
-                hourly_forecasts = optimal_day.get("hour", [])
-                hourly_predictions = []
-                for hour_data in hourly_forecasts:
-                    # Construct feature vector from hourly data using keys from WeatherAPI.
-                    # (Adjust keys if necessary. Here we use temp_c, precip_mm, wind_kph, and humidity.)
-                    temp = hour_data.get("temp_c")
-                    precip = hour_data.get("precip_mm", 0)
-                    wind = hour_data.get("wind_kph", 0)
-                    hum = hour_data.get("humidity", 0)
-                    features = np.array([temp, precip, wind, hum])
-                    expected_features = model.n_features_in_
-                    # Pad with zeros if model expects more features than 4.
-                    if expected_features > 4:
-                        features = np.pad(features, (0, expected_features - 4), mode='constant')
-                    features = features.reshape(1, -1)
-                    pred = model.predict(features)
-                    hourly_predictions.append(pred[0])
-                
-                # Count occurrences of each predicted label
-                unique, counts = np.unique(hourly_predictions, return_counts=True)
-                # Map the numeric predictions to labels using your comfort_map.
-                comfort_map = {0: "Low", 1: "Medium", 2: "High"}
-                prediction_summary = {comfort_map[k]: v for k, v in zip(unique, counts)}
-                # Ensure all classes are represented
-                for label in ["Low", "Medium", "High"]:
-                    if label not in prediction_summary:
-                        prediction_summary[label] = 0
-                        
-                st.markdown("### Hourly Prediction Summary for Optimal Date")
-                st.write(prediction_summary)
-            else:
-                st.error("Optimal date not found in forecast data.")
-
+            # --- Retrieve 7-Day Historical Predictions using weather_prediction module ---
+            # Import the weather_prediction module (assumed to be in your project)
+            import weather_prediction  # make sure this module is accessible
+            
+            # Retrieve hourly predictions for the optimal date from your weather_prediction module.
+            predictions = weather_prediction.predict_weather(optimal_date)
+            # Filter predictions for the selected destination.
+            filtered_predictions = [p for p in predictions if p[1] == selected_destination]
+            # Count occurrences of each predicted class.
+            prediction_counts = Counter([p[2] for p in filtered_predictions])
+            
+            # Ensure all classes are represented.
+            for label in ["Low", "Medium", "High"]:
+                if label not in prediction_counts:
+                    prediction_counts[label] = 0
+                    
+            st.markdown("### Hourly Prediction Summary for Optimal Date")
+            st.write(dict(prediction_counts))
             
             # --- Historical Data: Print Last 7 Days from Current Date ---
             if show_historical:
